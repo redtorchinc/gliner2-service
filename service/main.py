@@ -6,8 +6,9 @@ import hmac
 import logging
 import time
 import traceback
-from typing import Any, Dict
+from typing import Any, Callable, Dict
 
+import torch
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
@@ -68,7 +69,7 @@ async def _get_model():
 def _validate_text(text: str) -> None:
     if len(text) > settings.max_text_chars:
         raise HTTPException(
-            status_code=400,
+            status_code=413,
             detail=f"Text length {len(text)} exceeds maximum of {settings.max_text_chars} characters",
         )
 
@@ -76,13 +77,13 @@ def _validate_text(text: str) -> None:
 def _validate_texts(texts: list[str]) -> None:
     if len(texts) > settings.max_batch_size:
         raise HTTPException(
-            status_code=400,
+            status_code=413,
             detail=f"Batch size {len(texts)} exceeds maximum of {settings.max_batch_size}",
         )
     for i, t in enumerate(texts):
         if len(t) > settings.max_text_chars:
             raise HTTPException(
-                status_code=400,
+                status_code=413,
                 detail=f"texts[{i}] length {len(t)} exceeds maximum of {settings.max_text_chars} characters",
             )
 
@@ -90,9 +91,33 @@ def _validate_texts(texts: list[str]) -> None:
 def _validate_batch_size(batch_size: int) -> None:
     if batch_size > settings.max_batch_size:
         raise HTTPException(
-            status_code=400,
+            status_code=413,
             detail=f"batch_size {batch_size} exceeds maximum of {settings.max_batch_size}",
         )
+
+
+def _cuda_cache_clear() -> None:
+    """Free cached CUDA memory after each inference call."""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+async def _run_inference(fn: Callable, *args, **kwargs) -> Any:
+    """Run a model call in the threadpool, catching OOM and clearing CUDA cache."""
+    try:
+        result = await run_in_threadpool(fn, *args, **kwargs)
+    except torch.cuda.OutOfMemoryError:
+        _cuda_cache_clear()
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                "CUDA out of memory — input is too large for available GPU memory. "
+                "Try shorter text, a smaller batch_size, or set max_len. "
+                "Hint: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True may help."
+            ),
+        )
+    _cuda_cache_clear()
+    return result
 
 
 def _response(result: Any, elapsed: float) -> ExtractionResponse:
@@ -144,7 +169,7 @@ def create_app() -> FastAPI:
     async def extract_entities(req: EntitiesRequest, model=Depends(_get_model)):
         _validate_text(req.text)
         t0 = time.perf_counter()
-        result = await run_in_threadpool(
+        result = await _run_inference(
             model.extract_entities,
             text=req.text,
             entity_types=req.entity_types,
@@ -161,7 +186,7 @@ def create_app() -> FastAPI:
         _validate_texts(req.texts)
         _validate_batch_size(req.batch_size)
         t0 = time.perf_counter()
-        result = await run_in_threadpool(
+        result = await _run_inference(
             model.batch_extract_entities,
             texts=req.texts,
             entity_types=req.entity_types,
@@ -180,7 +205,7 @@ def create_app() -> FastAPI:
     async def classify_text(req: ClassifyRequest, model=Depends(_get_model)):
         _validate_text(req.text)
         t0 = time.perf_counter()
-        result = await run_in_threadpool(
+        result = await _run_inference(
             model.classify_text,
             text=req.text,
             tasks=req.tasks,
@@ -197,7 +222,7 @@ def create_app() -> FastAPI:
         _validate_texts(req.texts)
         _validate_batch_size(req.batch_size)
         t0 = time.perf_counter()
-        result = await run_in_threadpool(
+        result = await _run_inference(
             model.batch_classify_text,
             texts=req.texts,
             tasks=req.tasks,
@@ -216,7 +241,7 @@ def create_app() -> FastAPI:
     async def extract_json(req: ExtractJsonRequest, model=Depends(_get_model)):
         _validate_text(req.text)
         t0 = time.perf_counter()
-        result = await run_in_threadpool(
+        result = await _run_inference(
             model.extract_json,
             text=req.text,
             structures=req.structures,
@@ -233,7 +258,7 @@ def create_app() -> FastAPI:
         _validate_texts(req.texts)
         _validate_batch_size(req.batch_size)
         t0 = time.perf_counter()
-        result = await run_in_threadpool(
+        result = await _run_inference(
             model.batch_extract_json,
             texts=req.texts,
             structures=req.structures,
@@ -252,7 +277,7 @@ def create_app() -> FastAPI:
     async def extract_relations(req: RelationsRequest, model=Depends(_get_model)):
         _validate_text(req.text)
         t0 = time.perf_counter()
-        result = await run_in_threadpool(
+        result = await _run_inference(
             model.extract_relations,
             text=req.text,
             relation_types=req.relation_types,
@@ -269,7 +294,7 @@ def create_app() -> FastAPI:
         _validate_texts(req.texts)
         _validate_batch_size(req.batch_size)
         t0 = time.perf_counter()
-        result = await run_in_threadpool(
+        result = await _run_inference(
             model.batch_extract_relations,
             texts=req.texts,
             relation_types=req.relation_types,
@@ -293,7 +318,7 @@ def create_app() -> FastAPI:
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         t0 = time.perf_counter()
-        result = await run_in_threadpool(
+        result = await _run_inference(
             model.extract,
             text=req.text,
             schema=schema,
@@ -315,7 +340,7 @@ def create_app() -> FastAPI:
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         t0 = time.perf_counter()
-        result = await run_in_threadpool(
+        result = await _run_inference(
             model.batch_extract,
             texts=req.texts,
             schemas=schema,
