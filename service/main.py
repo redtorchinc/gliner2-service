@@ -54,7 +54,10 @@ def _check_auth(request: Request) -> None:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
-def _get_model():
+async def _get_model():
+    # Must be async so FastAPI does NOT run this in a threadpool.
+    # huggingface_hub's httpx client breaks when used from a worker thread.
+    # Blocks the event loop only on first call (model download); instant after.
     return _manager.get()
 
 
