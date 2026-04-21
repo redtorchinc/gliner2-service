@@ -1,0 +1,34 @@
+[Unit]
+Description=GLiNER2 FastAPI Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+Group=@USER@
+WorkingDirectory=@REPO_DIR@
+Environment="PATH=@VENV_DIR@/bin"
+Environment="GLINER2_HOST=@HOST@"
+Environment="GLINER2_PORT=@PORT@"
+EnvironmentFile=-@REPO_DIR@/.env
+ExecStart=@VENV_DIR@/bin/uvicorn service.main:app \
+    --host ${GLINER2_HOST} \
+    --port ${GLINER2_PORT} \
+    --workers 1 \
+    --log-level info \
+    --no-access-log
+Restart=on-failure
+RestartSec=3
+# Give the model time to load on first request
+TimeoutStartSec=120
+# Reasonable hardening — safe for a local service
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+# Allow writing to the HF cache, the venv, and the repo dir
+ReadWritePaths=@REPO_DIR@ %h/.cache/huggingface
+
+[Install]
+WantedBy=multi-user.target
