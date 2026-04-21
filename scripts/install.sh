@@ -12,6 +12,7 @@ REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 VENV_DIR="${REPO_DIR}/.venv-service"
 SERVICE_NAME="gliner2-service"
 SERVICE_USER="${USER}"
+HOME_DIR=$(eval echo "~${SERVICE_USER}")
 HOST="${GLINER2_HOST:-127.0.0.1}"
 PORT="${GLINER2_PORT:-8077}"
 
@@ -107,10 +108,14 @@ echo "Installing systemd unit ..."
 UNIT_SRC="${REPO_DIR}/scripts/gliner2-service.service"
 UNIT_TMP="/tmp/${SERVICE_NAME}.service"
 
+# Ensure HF cache directory exists
+mkdir -p "${HOME_DIR}/.cache"
+
 sed \
     -e "s|@REPO_DIR@|${REPO_DIR}|g" \
     -e "s|@VENV_DIR@|${VENV_DIR}|g" \
     -e "s|@USER@|${SERVICE_USER}|g" \
+    -e "s|@HOME_DIR@|${HOME_DIR}|g" \
     -e "s|@HOST@|${HOST}|g" \
     -e "s|@PORT@|${PORT}|g" \
     "${UNIT_SRC}" > "${UNIT_TMP}"

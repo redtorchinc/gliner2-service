@@ -26,9 +26,8 @@ TimeoutStartSec=120
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
-ProtectHome=read-only
 # Allow writing to the HF cache, the venv, and the repo dir
-ReadWritePaths=@REPO_DIR@ %h/.cache/huggingface
+ReadWritePaths=@REPO_DIR@ @HOME_DIR@/.cache
 
 [Install]
 WantedBy=multi-user.target
