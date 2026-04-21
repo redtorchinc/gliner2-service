@@ -1,12 +1,15 @@
 """
-Custom LoRA (Low-Rank Adaptation) Implementation for GLiNER2
-=============================================================
+Custom LoRA / DoRA Implementation for GLiNER2
+===============================================
 
 Parameter-efficient fine-tuning by injecting trainable low-rank matrices
 into frozen linear layers of the encoder.
 
-Based on: "LoRA: Low-Rank Adaptation of Large Language Models"
-Paper: https://arxiv.org/abs/2106.09685
+LoRA: "Low-Rank Adaptation of Large Language Models"
+      https://arxiv.org/abs/2106.09685
+
+DoRA: "Weight-Decomposed Low-Rank Adaptation"
+      https://arxiv.org/abs/2402.09353
 """
 
 from __future__ import annotations
@@ -73,7 +76,13 @@ class LoRAConfig:
     alpha: float = 16.0
     dropout: float = 0.0
     target_modules: List[str] = field(default_factory=lambda: ["encoder"])
-    
+    use_dora: bool = False
+    """If True, use DoRA (Weight-Decomposed Low-Rank Adaptation) instead of
+    standard LoRA.  DoRA decomposes pretrained weights into magnitude and
+    direction, applying LoRA only to the direction component.  This often
+    yields better accuracy at a small parameter overhead (one extra vector
+    per layer)."""
+
     def __post_init__(self):
         if self.r <= 0:
             raise ValueError(f"LoRA rank must be > 0, got {self.r}")
@@ -294,6 +303,132 @@ class LoRALayer(nn.Module):
 
 
 # =============================================================================
+# DoRA Layer (Weight-Decomposed Low-Rank Adaptation)
+# =============================================================================
+
+class DoRALayer(nn.Module):
+    """
+    DoRA-enhanced Linear layer.
+
+    Decomposes the pretrained weight ``W`` into a magnitude vector ``m`` and
+    a direction matrix ``V`` (column-normalised ``W``).  A standard LoRA
+    delta is applied to the direction only, and the magnitude is trained
+    separately::
+
+        V' = V + (B @ A) * scaling          # updated direction
+        output = x @ (m * V' / ||V'||).T + bias
+
+    This preserves the original weight norm while allowing the direction to
+    be efficiently adapted.
+
+    Reference: "DoRA: Weight-Decomposed Low-Rank Adaptation" (Liu et al., 2024)
+    """
+
+    def __init__(
+        self,
+        base_layer: nn.Linear,
+        r: int,
+        alpha: float,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+
+        self.r = r
+        self.alpha = alpha
+        self.scaling = alpha / r
+
+        in_features = base_layer.in_features
+        out_features = base_layer.out_features
+
+        # Store frozen base layer
+        self.base_layer = base_layer
+        for param in self.base_layer.parameters():
+            param.requires_grad = False
+
+        device = next(base_layer.parameters()).device
+        dtype = base_layer.weight.dtype
+
+        # --- Magnitude / direction decomposition ---
+        # Column norms of W  (one scalar per output neuron)
+        weight = base_layer.weight.data.to(torch.float32)
+        self.magnitude = nn.Parameter(
+            weight.norm(p=2, dim=1).to(dtype).to(device)
+        )  # (out_features,)
+
+        # LoRA low-rank matrices (same as standard LoRA)
+        self.lora_A = nn.Parameter(torch.zeros(r, in_features, device=device, dtype=dtype))
+        self.lora_B = nn.Parameter(torch.zeros(out_features, r, device=device, dtype=dtype))
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+
+        self.lora_dropout = nn.Dropout(p=dropout) if dropout > 0 else nn.Identity()
+        self.merged = False
+
+    # --- Compatibility properties (same as LoRALayer) ---
+    @property
+    def weight(self):
+        return self.base_layer.weight
+
+    @property
+    def bias(self):
+        return self.base_layer.bias
+
+    @property
+    def in_features(self):
+        return self.base_layer.in_features
+
+    @property
+    def out_features(self):
+        return self.base_layer.out_features
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.merged:
+            return self.base_layer(x)
+
+        # Direction from frozen base weight
+        base_weight = self.base_layer.weight  # (out, in)
+
+        # LoRA delta applied to the direction
+        lora_delta = self.lora_B @ self.lora_A  # (out, in)
+        adapted = base_weight + lora_delta * self.scaling
+
+        # Column-normalise, then scale by trainable magnitude
+        col_norm = adapted.norm(p=2, dim=1, keepdim=True).clamp(min=1e-8)
+        weight_new = self.magnitude.unsqueeze(1) * (adapted / col_norm)
+
+        output = self.lora_dropout(x) @ weight_new.T
+        if self.base_layer.bias is not None:
+            output = output + self.base_layer.bias
+        return output
+
+    def merge_weights(self):
+        """Merge DoRA decomposition back into the base weight."""
+        if self.merged:
+            return
+        with torch.no_grad():
+            lora_delta = (self.lora_B @ self.lora_A) * self.scaling
+            adapted = self.base_layer.weight.data + lora_delta
+            col_norm = adapted.norm(p=2, dim=1, keepdim=True).clamp(min=1e-8)
+            self.base_layer.weight.data = self.magnitude.unsqueeze(1) * (adapted / col_norm)
+        self.merged = True
+        logger.debug(f"Merged DoRA weights (r={self.r}) into base layer")
+
+    def unmerge_weights(self):
+        """Unmerge is not exactly invertible for DoRA (the original base weight
+        is lost once overwritten).  We store nothing extra, so raise."""
+        raise NotImplementedError(
+            "DoRA merge is destructive — the original base weight cannot be "
+            "recovered.  Use save_adapter_only=True to avoid full-model saves "
+            "that require merge/unmerge."
+        )
+
+    def extra_repr(self) -> str:
+        return (
+            f"r={self.r}, alpha={self.alpha}, scaling={self.scaling:.4f}, "
+            f"merged={self.merged}, dora=True"
+        )
+
+
+# =============================================================================
 # LoRA Application Functions
 # =============================================================================
 
@@ -372,8 +507,9 @@ def apply_lora_to_model(
             
             # Apply LoRA to matching Linear layers
             if isinstance(child, nn.Linear) and _should_apply_lora(name, full_name):
-                # Replace with LoRA layer
-                lora_layer = LoRALayer(
+                # Choose between LoRA and DoRA
+                layer_cls = DoRALayer if config.use_dora else LoRALayer
+                lora_layer = layer_cls(
                     base_layer=child,
                     r=config.r,
                     alpha=config.alpha,
@@ -419,7 +555,9 @@ def get_lora_parameters(model: nn.Module) -> List[nn.Parameter]:
     """
     lora_params = []
     for module in model.modules():
-        if isinstance(module, LoRALayer):
+        if isinstance(module, DoRALayer):
+            lora_params.extend([module.lora_A, module.lora_B, module.magnitude])
+        elif isinstance(module, LoRALayer):
             lora_params.extend([module.lora_A, module.lora_B])
     return lora_params
 
@@ -440,9 +578,11 @@ def get_lora_state_dict(model: nn.Module) -> Dict[str, torch.Tensor]:
     """
     lora_state = {}
     for name, module in model.named_modules():
-        if isinstance(module, LoRALayer):
+        if isinstance(module, (LoRALayer, DoRALayer)):
             lora_state[f"{name}.lora_A"] = module.lora_A.data
             lora_state[f"{name}.lora_B"] = module.lora_B.data
+            if isinstance(module, DoRALayer):
+                lora_state[f"{name}.magnitude"] = module.magnitude.data
     return lora_state
 
 
@@ -466,23 +606,23 @@ def merge_lora_weights(model: nn.Module) -> int:
     count = 0
     already_merged = 0
     for module in model.modules():
-        if isinstance(module, LoRALayer):
+        if isinstance(module, (LoRALayer, DoRALayer)):
             if not module.merged:
                 module.merge_weights()
                 count += 1
             else:
                 already_merged += 1
-    
+
     if count > 0:
-        logger.debug(f"Merged LoRA weights in {count} layers")
+        logger.debug(f"Merged LoRA/DoRA weights in {count} layers")
     if already_merged > 0:
         logger.debug(f"Skipped {already_merged} layers (already merged)")
-    
-    # Remove LoRA layers after merging
+
+    # Remove LoRA/DoRA layers after merging
     if count > 0 or already_merged > 0:
         remove_lora_from_model(model)
-        logger.info(f"Merged and removed LoRA layers from model")
-    
+        logger.info(f"Merged and removed LoRA/DoRA layers from model")
+
     return count
 
 
@@ -503,13 +643,13 @@ def unmerge_lora_weights(model: nn.Module) -> int:
     count = 0
     not_merged = 0
     for module in model.modules():
-        if isinstance(module, LoRALayer):
+        if isinstance(module, (LoRALayer, DoRALayer)):
             if module.merged:
                 module.unmerge_weights()
                 count += 1
             else:
                 not_merged += 1
-    
+
     if count > 0:
         logger.debug(f"Unmerged LoRA weights in {count} layers")
     if not_merged > 0:
@@ -555,11 +695,12 @@ def print_lora_info(model: nn.Module, config: LoRAConfig):
     """
     lora_params, total_params, percentage = count_lora_parameters(model)
     
-    # Count LoRA layers
-    num_lora_layers = sum(1 for m in model.modules() if isinstance(m, LoRALayer))
-    
+    # Count LoRA/DoRA layers
+    num_lora_layers = sum(1 for m in model.modules() if isinstance(m, (LoRALayer, DoRALayer)))
+    adapter_label = "DoRA" if config.use_dora else "LoRA"
+
     print("=" * 70)
-    print("🔧 LoRA Configuration")
+    print(f"🔧 {adapter_label} Configuration")
     print("=" * 70)
     print(f"Enabled            : {config.enabled}")
     print(f"Rank (r)           : {config.r}")
@@ -591,18 +732,18 @@ def remove_lora_from_model(model: nn.Module) -> nn.Module:
     """
     def _remove_lora_recursive(module: nn.Module):
         for name, child in module.named_children():
-            if isinstance(child, LoRALayer):
+            if isinstance(child, (LoRALayer, DoRALayer)):
                 # Ensure weights are merged
                 if not child.merged:
                     child.merge_weights()
-                # Replace LoRALayer with its base layer
+                # Replace with its base layer
                 setattr(module, name, child.base_layer)
-                logger.debug(f"Removed LoRA from {name}, restored base layer")
+                logger.debug(f"Removed LoRA/DoRA from {name}, restored base layer")
             else:
                 _remove_lora_recursive(child)
-    
+
     _remove_lora_recursive(model)
-    logger.info("Removed all LoRA layers from model")
+    logger.info("Removed all LoRA/DoRA layers from model")
     return model
 
 
@@ -632,8 +773,9 @@ def save_lora_adapter(
     lora_state = {}
     lora_config = None
     
+    is_dora = False
     for name, module in model.named_modules():
-        if isinstance(module, LoRALayer):
+        if isinstance(module, (LoRALayer, DoRALayer)):
             if module.merged:
                 raise ValueError(
                     "Cannot save adapter with merged weights. "
@@ -642,8 +784,11 @@ def save_lora_adapter(
             # Save LoRA matrices with full path from model root
             lora_state[f"{name}.lora_A"] = module.lora_A.data
             lora_state[f"{name}.lora_B"] = module.lora_B.data
-            
-            # Extract config from first LoRA layer
+            if isinstance(module, DoRALayer):
+                lora_state[f"{name}.magnitude"] = module.magnitude.data
+                is_dora = True
+
+            # Extract config from first layer
             if lora_config is None:
                 lora_config = {
                     "lora_r": module.r,
@@ -674,7 +819,7 @@ def save_lora_adapter(
     
     # Create and save adapter config
     adapter_config = LoRAAdapterConfig(
-        adapter_type="lora",
+        adapter_type="dora" if is_dora else "lora",
         adapter_version="1.0",
         lora_r=lora_config["lora_r"],
         lora_alpha=lora_config["lora_alpha"],
@@ -721,28 +866,33 @@ def load_lora_adapter(
     lora_state = load_file(str(weights_path))
     logger.info(f"Loaded {len(lora_state)} LoRA tensors from {weights_path}")
     
-    # Apply LoRA to matching layers
+    # Apply LoRA/DoRA to matching layers
+    is_dora = adapter_config.adapter_type == "dora"
     lora_config = LoRAConfig(
         enabled=True,
         r=adapter_config.lora_r,
         alpha=adapter_config.lora_alpha,
         dropout=adapter_config.lora_dropout,
         target_modules=adapter_config.target_modules,
+        use_dora=is_dora,
     )
-    
+
     model, lora_layers = apply_lora_to_model(model, lora_config)
-    
-    # Load saved weights into LoRA layers
+
+    # Load saved weights into LoRA/DoRA layers
     for name, module in model.named_modules():
-        if isinstance(module, LoRALayer):
+        if isinstance(module, (LoRALayer, DoRALayer)):
             lora_a_key = f"{name}.lora_A"
             lora_b_key = f"{name}.lora_B"
-            
+
             if lora_a_key in lora_state and lora_b_key in lora_state:
-                # Move loaded tensors to the same device as the module
                 device = next(module.parameters()).device
                 module.lora_A.data = lora_state[lora_a_key].to(device)
                 module.lora_B.data = lora_state[lora_b_key].to(device)
+                # Load magnitude for DoRA layers
+                mag_key = f"{name}.magnitude"
+                if isinstance(module, DoRALayer) and mag_key in lora_state:
+                    module.magnitude.data = lora_state[mag_key].to(device)
                 logger.debug(f"Loaded weights for {name}")
             else:
                 logger.warning(f"No saved weights found for {name}")
@@ -771,10 +921,10 @@ def unload_lora_adapter(model: nn.Module) -> int:
             parent = getattr(parent, part)
         return parent, parts[-1]
     
-    # Collect all LoRA layers first (to avoid modifying dict during iteration)
+    # Collect all LoRA/DoRA layers first (to avoid modifying dict during iteration)
     lora_layers = []
     for name, module in model.named_modules():
-        if isinstance(module, LoRALayer):
+        if isinstance(module, (LoRALayer, DoRALayer)):
             lora_layers.append((name, module))
     
     # Remove LoRA layers
@@ -792,9 +942,9 @@ def unload_lora_adapter(model: nn.Module) -> int:
 
 
 def has_lora_adapter(model: nn.Module) -> bool:
-    """Check if model has LoRA layers applied."""
+    """Check if model has LoRA or DoRA layers applied."""
     for module in model.modules():
-        if isinstance(module, LoRALayer):
+        if isinstance(module, (LoRALayer, DoRALayer)):
             return True
     return False
 
@@ -810,20 +960,19 @@ def get_adapter_config(model: nn.Module) -> Optional[LoRAAdapterConfig]:
     if not has_lora_adapter(model):
         return None
     
-    # Extract config from first LoRA layer
+    # Extract config from first LoRA/DoRA layer
     for module in model.modules():
-        if isinstance(module, LoRALayer):
+        if isinstance(module, (LoRALayer, DoRALayer)):
             target_modules = set()
-            # Collect all target module groups (top-level modules)
+            is_dora = isinstance(module, DoRALayer)
             for name, m in model.named_modules():
-                if isinstance(m, LoRALayer):
-                    # Extract first level module name
+                if isinstance(m, (LoRALayer, DoRALayer)):
                     parts = name.split(".")
                     if parts:
                         target_modules.add(parts[0])
-            
+
             return LoRAAdapterConfig(
-                adapter_type="lora",
+                adapter_type="dora" if is_dora else "lora",
                 adapter_version="1.0",
                 lora_r=module.r,
                 lora_alpha=module.alpha,

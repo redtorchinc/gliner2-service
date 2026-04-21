@@ -233,6 +233,66 @@ This stops the service, removes the systemd unit, and optionally deletes the vir
 
 The service runs a single uvicorn worker because the model is held in-process memory and is not fork-safe. Do **not** increase `--workers`. For more throughput, run multiple instances on different ports behind a reverse proxy (e.g. nginx).
 
+## DoRA Training (Weight-Decomposed Low-Rank Adaptation)
+
+DoRA decomposes pretrained weights into magnitude and direction, applying LoRA only to the direction component. This often yields better accuracy than standard LoRA at a small parameter overhead.
+
+Reference: [DoRA: Weight-Decomposed Low-Rank Adaptation](https://arxiv.org/abs/2402.09353) (Liu et al., 2024)
+
+```python
+from gliner2 import GLiNER2
+from gliner2.training.data import InputExample
+from gliner2.training.trainer import GLiNER2Trainer, TrainingConfig
+
+# Prepare domain-specific data
+legal_examples = [
+    InputExample(
+        text="Apple Inc. filed a lawsuit against Samsung Electronics.",
+        entities={"company": ["Apple Inc.", "Samsung Electronics"]}
+    ),
+    InputExample(
+        text="The SEC investigated Goldman Sachs for securities fraud.",
+        entities={"company": ["Goldman Sachs"], "government_body": ["SEC"]}
+    ),
+    # Add more examples...
+]
+
+# Configure DoRA training
+model = GLiNER2.from_pretrained("fastino/gliner2-large-v1")
+config = TrainingConfig(
+    output_dir="./legal_adapter_dora",
+    num_epochs=10,
+    batch_size=8,
+    encoder_lr=1e-5,
+    task_lr=5e-4,
+
+    # DoRA settings — same LoRA params, just add use_dora=True
+    use_dora=True,                    # Enable DoRA (automatically enables LoRA)
+    lora_r=8,                         # Rank (4, 8, 16, 32)
+    lora_alpha=16.0,                  # Scaling factor (usually 2*r)
+    lora_dropout=0.0,                 # Dropout for adapter layers
+    save_adapter_only=True            # Save only adapter (~5-10 MB)
+)
+
+# Train adapter
+trainer = GLiNER2Trainer(model, config)
+trainer.train(train_data=legal_examples)
+
+# Use the adapter
+model.load_adapter("./legal_adapter_dora/final")
+results = model.extract_entities(
+    "Pfizer acquired Seagen in a $43 billion deal.",
+    ["company"]
+)
+print(results)
+```
+
+**DoRA vs LoRA:**
+- **Better accuracy**: DoRA separates what (magnitude) from where (direction), giving the optimizer more freedom
+- **Same interface**: Just add `use_dora=True` — all other LoRA parameters work identically
+- **Slight overhead**: One extra vector per layer (negligible vs the LoRA matrices)
+- **Adapters are interchangeable**: Save/load works the same; adapter type is auto-detected
+
 ## GPU Support
 
 If you want CUDA inference:

@@ -220,8 +220,9 @@ class TrainingConfig:
     validate_data: bool = True
     max_len: Optional[int] = None
 
-    # LoRA Configuration (Parameter-Efficient Fine-Tuning)
+    # LoRA / DoRA Configuration (Parameter-Efficient Fine-Tuning)
     use_lora: bool = False
+    use_dora: bool = False  # Use DoRA (Weight-Decomposed LoRA) instead of standard LoRA
     lora_r: int = 16
     lora_alpha: float = 32.0
     lora_dropout: float = 0.0
@@ -251,6 +252,10 @@ class TrainingConfig:
         if self.gradient_accumulation_steps <= 0:
             raise ValueError(f"gradient_accumulation_steps must be > 0, got {self.gradient_accumulation_steps}")
         
+        # DoRA implies LoRA
+        if self.use_dora:
+            self.use_lora = True
+
         # Validate LoRA configuration
         if self.use_lora:
             if self.lora_r <= 0:
@@ -633,6 +638,7 @@ class GLiNER2Trainer:
             alpha=self.config.lora_alpha,
             dropout=self.config.lora_dropout,
             target_modules=self.config.lora_target_modules,
+            use_dora=self.config.use_dora,
         )
         
         # Apply LoRA (encoder: targeted modules, non-encoder: all linear layers)

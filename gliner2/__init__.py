@@ -13,6 +13,7 @@ from .training.lora import (
     LoRAConfig,
     LoRAAdapterConfig,
     LoRALayer,
+    DoRALayer,
     load_lora_adapter,
     save_lora_adapter,
     unload_lora_adapter,
