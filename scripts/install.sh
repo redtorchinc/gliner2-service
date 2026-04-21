@@ -81,7 +81,7 @@ fi
 source "${VENV_DIR}/bin/activate"
 
 echo "Upgrading pip ..."
-pip install --upgrade pip wheel setuptools -q
+pip install --upgrade pip wheel "setuptools<82" -q
 
 # ---------------------------------------------------------------------------
 # Install dependencies
