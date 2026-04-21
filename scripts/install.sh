@@ -13,7 +13,7 @@ VENV_DIR="${REPO_DIR}/.venv-service"
 SERVICE_NAME="gliner2-service"
 SERVICE_USER="${USER}"
 HOME_DIR=$(eval echo "~${SERVICE_USER}")
-HOST="${GLINER2_HOST:-127.0.0.1}"
+HOST="${GLINER2_HOST:-0.0.0.0}"
 PORT="${GLINER2_PORT:-8077}"
 
 # ---------------------------------------------------------------------------
