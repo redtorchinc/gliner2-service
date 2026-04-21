@@ -70,10 +70,11 @@ echo ""
 # ---------------------------------------------------------------------------
 # Create virtual environment
 # ---------------------------------------------------------------------------
-if [ -d "${VENV_DIR}" ]; then
+if [ -f "${VENV_DIR}/bin/activate" ]; then
     echo "Reusing existing venv at ${VENV_DIR}"
 else
     echo "Creating virtual environment ..."
+    rm -rf "${VENV_DIR}"
     "$PYTHON" -m venv "${VENV_DIR}"
 fi
 
