@@ -707,13 +707,14 @@ class Extractor(PreTrainedModel):
         tokenizer = AutoTokenizer.from_pretrained(repo_or_dir)
         model = cls(config, encoder_config=encoder_config, tokenizer=tokenizer)
 
-        # Load weights
+        # Load weights — use target device directly to avoid double allocation
+        _load_device = map_location or "cpu"
         try:
             model_path = download_or_local(repo_or_dir, "model.safetensors")
-            state_dict = load_file(model_path)
+            state_dict = load_file(model_path, device=_load_device)
         except Exception:
             model_path = download_or_local(repo_or_dir, "pytorch_model.bin")
-            state_dict = torch.load(model_path, map_location="cpu")
+            state_dict = torch.load(model_path, map_location=_load_device)
 
         # Handle embedding size mismatch
         try:
@@ -723,13 +724,17 @@ class Extractor(PreTrainedModel):
                 extra = model_emb.shape[0] - saved_emb.shape[0]
                 state_dict["encoder.embeddings.word_embeddings.weight"] = torch.cat([
                     saved_emb,
-                    torch.randn(extra, saved_emb.shape[1]) * 0.02
+                    torch.randn(extra, saved_emb.shape[1], device=_load_device) * 0.02
                 ], dim=0)
         except KeyError:
             pass
 
-        model.load_state_dict(state_dict)
+        # assign=True replaces parameter tensors in-place (no copy),
+        # so the model ends up on _load_device without a redundant .to() first.
+        model.load_state_dict(state_dict, assign=True)
+        del state_dict
 
+        # Move any remaining buffers / non-parameter tensors to target device
         if map_location is not None:
             model = model.to(map_location)
 
