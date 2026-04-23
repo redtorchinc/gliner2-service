@@ -19,7 +19,8 @@ logger = logging.getLogger(__name__)
 from gliner.modeling.span_rep import SpanRepLayer
 from gliner2.layers import CountLSTMoE, CountLSTM, create_mlp, CountLSTMv2
 from gliner2.processor import SchemaTransformer, PreprocessedBatch, SamplingConfig
-from safetensors.torch import save_file, load_file
+from safetensors import safe_open
+from safetensors.torch import save_file
 from transformers import (
     PretrainedConfig,
     PreTrainedModel,
@@ -707,13 +708,23 @@ class Extractor(PreTrainedModel):
         tokenizer = AutoTokenizer.from_pretrained(repo_or_dir)
         model = cls(config, encoder_config=encoder_config, tokenizer=tokenizer)
 
-        # Load weights — use target device directly to avoid double allocation
+        # Load weights — stream tensors one-at-a-time to target device via
+        # safe_open to avoid materialising the full state dict in memory.
         _load_device = map_location or "cpu"
+        _safetensors = True
         try:
             model_path = download_or_local(repo_or_dir, "model.safetensors")
-            state_dict = load_file(model_path, device=_load_device)
         except Exception:
+            _safetensors = False
             model_path = download_or_local(repo_or_dir, "pytorch_model.bin")
+
+        if _safetensors:
+            # Stream each tensor directly to target device
+            state_dict = {}
+            with safe_open(model_path, framework="pt", device=str(_load_device)) as f:
+                for key in f.keys():
+                    state_dict[key] = f.get_tensor(key)
+        else:
             state_dict = torch.load(model_path, map_location=_load_device)
 
         # Handle embedding size mismatch
@@ -729,14 +740,17 @@ class Extractor(PreTrainedModel):
         except KeyError:
             pass
 
-        # assign=True replaces parameter tensors in-place (no copy),
-        # so the model ends up on _load_device without a redundant .to() first.
+        # assign=True swaps parameter tensors in-place (no copy), so the
+        # model ends up on _load_device without a redundant .to() first.
         model.load_state_dict(state_dict, assign=True)
         del state_dict
 
         # Move any remaining buffers / non-parameter tensors to target device
         if map_location is not None:
             model = model.to(map_location)
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         if quantize:
             model.quantize()

@@ -360,6 +360,24 @@ def create_app() -> FastAPI:
         await run_in_threadpool(_manager.reload)
         return {"status": "ok", **_manager.status()}
 
+    # --- Debug ---------------------------------------------------------------
+
+    @application.get("/v1/debug/gpu", dependencies=[Depends(_check_auth)])
+    async def debug_gpu() -> Dict[str, Any]:
+        if not torch.cuda.is_available():
+            return {"cuda": False}
+        idx = torch.cuda.current_device()
+        free, total = torch.cuda.mem_get_info(idx)
+        return {
+            "cuda": True,
+            "device": torch.cuda.get_device_name(idx),
+            "allocated_mb": round(torch.cuda.memory_allocated(idx) / 1048576, 1),
+            "reserved_mb": round(torch.cuda.memory_reserved(idx) / 1048576, 1),
+            "free_mb": round(free / 1048576, 1),
+            "total_mb": round(total / 1048576, 1),
+            "max_allocated_mb": round(torch.cuda.max_memory_allocated(idx) / 1048576, 1),
+        }
+
     return application
 
 
